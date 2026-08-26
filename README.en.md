@@ -46,7 +46,7 @@ Ideal combo: this plugin's inline card + ETA + stop, plus dsh-task-status's gene
 
 ```sh
 # Option 1: GitHub source (recommended; build artifacts are committed)
-dsh plugin --profile web add "github:<owner>/dsh-pwsh-progress#main"
+dsh plugin --profile web add "github:sssueason/dsh-pwsh-progress#main"
 
 # Option 2: npm
 npm add dsh-pwsh-progress

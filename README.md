@@ -46,7 +46,7 @@ GitHub 生态已有 [dsh-task-status](https://github.com/vlln/dsh-task-status)�
 
 ```sh
 # 方式一：GitHub 源码（推荐，构建产物已提交）
-dsh plugin --profile web add "github:<owner>/dsh-pwsh-progress#main"
+dsh plugin --profile web add "github:sssueason/dsh-pwsh-progress#main"
 
 # 方式二：npm
 npm add dsh-pwsh-progress
