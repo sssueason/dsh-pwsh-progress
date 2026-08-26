@@ -1,0 +1,7 @@
+# dsh-pwsh-progress bundle patch —— 对话流实时 pwsh 进度卡片。
+# 宿主半边（exports "."）运行于宿主进程：tools/execute 旁路登记 +
+# jobs 非消费跟踪 + /api/dsh-pwsh-progress/* 路由；浏览器半边
+# （exports "./client"）注入 tool.call.toolview key='pwsh' 渲染卡片。
+- insert:
+    - id: pwsh-progress
+      name: 'dsh-pwsh-progress'

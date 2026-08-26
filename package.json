@@ -1,0 +1,49 @@
+{
+  "name": "dsh-pwsh-progress",
+  "description": "对话流实时 pwsh 进度卡片：为 pwsh 工具（尤其 run_in_background 后台任务）渲染自定义工具卡片——命令、实时状态（running/stopping/completed/killed/failed）、耗时、**进度条**（从模型 job_output 已读输出解析 N/M 与 NN%）、**预计剩余时间**（输出比例估算 + 历史均值兜底）与「停止任务」按钮。宿主半边经 tools/execute 旁路登记后台任务并用**非消费式** jobs.get 跟踪（绝不读取输出游标，模型 job_output 语义零改动），HTTP 路由 /api/dsh-pwsh-progress/{state,kill} 供浏览器半边轮询。",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  },
+  "scripts": {
+    "test": "node --test test/smoke.test.mjs"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "test/*.mjs"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "pwsh",
+    "powershell",
+    "progress",
+    "eta",
+    "background-job"
+  ],
+  "license": "MIT"
+}
