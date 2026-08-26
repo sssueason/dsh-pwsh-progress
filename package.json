@@ -1,7 +1,7 @@
 {
   "name": "dsh-pwsh-progress",
   "description": "对话流实时任务进度：后台任务（pwsh/bash/subagent 等 run_in_background）显示状态、耗时、进度条、预计剩余时间与停止按钮；非消费式 jobs.get 跟踪，模型 job_output 不受影响。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "index.js",
   "exports": {

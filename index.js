@@ -124,7 +124,7 @@ function progressLabel(progress) {
  */
 export function apply(ctx) {
   const jobs = ctx.get('jobs');
-  // 登记表：jobId -> { jobId, agent, callId, command, last, progress, learned }。
+  // 登记表：jobId -> { jobId, agent, callId, command, last, progress, rate, lastPct, lastProgressAt, learned }。
   const byJob = new Map();
   // 历史学习：命令规范化键 -> { count, sumMs }（仅统计 completed）。
   const history = new Map();
@@ -170,11 +170,22 @@ export function apply(ctx) {
     return entry.last;
   };
 
+  /** 当前进度：最新解析值 + 两次读取间按速率平滑外推。 */
+  const currentPct = (entry, now) => {
+    const base = pctOf(entry.progress);
+    if (entry.rate > 0 && entry.lastPct !== null && entry.lastProgressAt !== null &&
+        entry.last !== null && entry.last.status === 'running') {
+      const projected = entry.lastPct + entry.rate * (now - entry.lastProgressAt);
+      if (projected > base) return Math.min(projected, 0.99);
+    }
+    return base;
+  };
+
   /** 计算 ETA：输出进度优先，历史均值兜底。 */
   const computeEta = (entry, now) => {
     if (entry === undefined || entry.last === null || entry.last.startedAt === null) return { etaMs: null, basis: null };
     const elapsed = now - entry.last.startedAt;
-    const pct = pctOf(entry.progress);
+    const pct = currentPct(entry, now);
     if (pct !== null && pct > 0.001 && pct < 0.999) {
       const remaining = elapsed * (1 - pct) / pct;
       return { etaMs: Math.round(remaining), basis: 'progress' };
@@ -193,7 +204,7 @@ export function apply(ctx) {
     const snap = entry.last;
     if (snap === null) return null;
     const eta = computeEta(entry, now);
-    const pct = pctOf(entry.progress);
+    const pct = currentPct(entry, now);
     return {
       jobId: entry.jobId,
       status: snap.status,
@@ -226,7 +237,17 @@ export function apply(ctx) {
         if (!result.isError && result.value !== null && typeof result.value === 'object' &&
             typeof result.value.text === 'string') {
           const parsed = parseProgress(result.value.text);
-          if (parsed !== null) entry.progress = parsed;
+          if (parsed !== null) {
+            const now = Date.now();
+            const newPct = pctOf(parsed);
+            if (entry.lastPct !== null && entry.lastProgressAt !== null && newPct > entry.lastPct) {
+              const dt = now - entry.lastProgressAt;
+              if (dt > 500) entry.rate = (newPct - entry.lastPct) / dt;
+            }
+            entry.progress = parsed;
+            entry.lastPct = newPct;
+            entry.lastProgressAt = now;
+          }
         }
         return result;
       } catch (err) {
@@ -247,6 +268,9 @@ export function apply(ctx) {
             command: labelOf(exec),
             last: null,
             progress: null,
+            rate: 0,
+            lastPct: null,
+            lastProgressAt: null,
             learned: false,
           });
           snapshotOf(jobId);
