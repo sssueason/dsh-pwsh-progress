@@ -1,7 +1,7 @@
 /**
  * dsh-pwsh-progress — smoke test（纯函数单元测试）。
  *
- * 直接 import 宿主半边（模块无外部依赖），验证进度解析与命令规范化：
+ * 直接 import 宿主侧（模块无外部依赖），验证进度解析与命令规范化：
  * - parseProgress：N/M 与 NN% 解析、多行取最后、边界与无效输入；
  * - cmdKeyOf：数字归一、大小写、空白折叠、截断；
  * - pctOf / progressLabel：比例换算与展示标签。

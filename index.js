@@ -1,22 +1,10 @@
 /**
- * dsh-pwsh-progress — 对话流实时 pwsh 进度卡片（宿主半边）。
+ * dsh-pwsh-progress — 宿主侧。
  *
- * 为 pwsh 工具（尤其 run_in_background 后台任务）提供实时进度数据：
- * 1. tools/execute 旁路登记：仅观察 pwsh 后台调用与 job_output 读取，
- *    不改 exec、不透传改动；后台调用解析返回的 jobId 并登记；
- * 2. 非消费式跟踪：jobs.get(jobId, agent) 只读 JobSnapshot（status/detail/
- *    startedAt/finishedAt），绝不调用 jobs.read —— 输出游标留给模型
- *    job_output，模型读取行为完全不受影响；
- * 3. 进度与 ETA：
- *    - 从模型 job_output 已读的输出副本（result.value.text，非消费）解析
- *      `N/M` 与 `NN%` 进度 → 实时进度条 + 按比例估算预计剩余时间；
- *    - 无输出进度时用历史均值兜底（命令规范化键 → completed 时长样本）；
- * 4. HTTP 路由（仅回环 + 同源）供浏览器半边轮询：
- *    POST /api/dsh-pwsh-progress/state {jobId} -> 标量状态 + 进度 + ETA
- *    POST /api/dsh-pwsh-progress/kill  {jobId} -> 请求停止
- *
- * 浏览器半边（exports "./client"）注入 tool.call.toolview key='pwsh'
- * 渲染进度卡片。本文件与动态插件 pwsh-1 的宿主逻辑同源。
+ * tools/execute 旁路登记所有后台任务（返回 {kind:'background', jobId} 的调用），
+ * 用非消费式 jobs.get 跟踪状态（绝不调用 jobs.read，模型 job_output 不受影响）；
+ * 从模型 job_output 已读输出解析 N/M、NN% 进度并估算 ETA（历史均值兜底）。
+ * 路由（仅回环 + 同源）：POST /api/dsh-pwsh-progress/{state,list,kill}
  */
 
 /** 稳定 cordis 插件名。 */
@@ -29,7 +17,7 @@ export const inject = ['webServer', 'systemPrompt'];
 const SECTION_ORDER = 215;
 
 /** 模型可见公告。 */
-export const PWSH_PROGRESS_GUIDANCE = '本机已安装 dsh-pwsh-progress 插件（对话流实时 pwsh 进度卡片）：pwsh 后台任务（run_in_background）会在对话流中显示实时进度卡片（状态/进度条/预计剩余时间/停止按钮），输出仍通过 job_output 读取，两者互补。';
+export const PWSH_PROGRESS_GUIDANCE = '本机已安装 dsh-pwsh-progress 插件（对话流实时任务进度）：pwsh/bash 等后台任务（run_in_background）会在对话流与每轮回复尾部显示实时进度（进度条/预计剩余时间/停止按钮），输出仍通过 job_output 读取，两者互补。';
 
 /** 回环 + 同源信任栅栏（只读状态 + 停止请求，仍按 dsh-ssh/dsh-cot 同款收紧）。 */
 function isLoopbackRequest(request) {
@@ -136,11 +124,21 @@ function progressLabel(progress) {
  */
 export function apply(ctx) {
   const jobs = ctx.get('jobs');
-  // 登记表：jobId -> { agent, callId, command, last, progress, learned }；callId -> 调用元信息。
-  const byCall = new Map();
+  // 登记表：jobId -> { jobId, agent, callId, command, last, progress, learned }。
   const byJob = new Map();
   // 历史学习：命令规范化键 -> { count, sumMs }（仅统计 completed）。
   const history = new Map();
+
+  /** 工具调用的展示标签：command > description > label > 工具名。 */
+  const labelOf = (exec) => {
+    const a = exec.arguments;
+    if (a !== null && typeof a === 'object') {
+      if (typeof a.command === 'string' && a.command.length > 0) return a.command;
+      if (typeof a.description === 'string' && a.description.length > 0) return a.description;
+      if (typeof a.label === 'string' && a.label.length > 0) return a.label;
+    }
+    return exec.name;
+  };
 
   /** 非消费式快照：jobs.get 不动输出游标，模型 job_output 完全不受影响。 */
   const snapshotOf = (jobId) => {
@@ -155,7 +153,7 @@ export function apply(ctx) {
         finishedAt: typeof snap.finishedAt === 'number' ? snap.finishedAt : null,
         label: snap.label,
       };
-      // 完成时记录历史（仅 completed，避免被 kill/fail 时长污染）。
+      // 仅 completed 记历史
       if (snap.status === 'completed' && entry.learned !== true &&
           entry.last.startedAt !== null && entry.last.finishedAt !== null) {
         entry.learned = true;
@@ -190,40 +188,34 @@ export function apply(ctx) {
     return { etaMs: null, basis: null };
   };
 
-  // 旁路观察：pwsh 后台调用登记 + job_output 输出解析进度。
+  /** 单任务标量投影（纯 JSON）。 */
+  const stateOf = (entry, now) => {
+    const snap = entry.last;
+    if (snap === null) return null;
+    const eta = computeEta(entry, now);
+    const pct = pctOf(entry.progress);
+    return {
+      jobId: entry.jobId,
+      status: snap.status,
+      detail: snap.detail,
+      startedAt: snap.startedAt,
+      finishedAt: snap.finishedAt,
+      command: entry.command,
+      elapsedMs: snap.finishedAt !== null ? snap.finishedAt - snap.startedAt
+        : (snap.startedAt !== null ? now - snap.startedAt : null),
+      progressPct: pct,
+      progressLabel: progressLabel(entry.progress),
+      etaMs: eta.etaMs,
+      etaBasis: eta.basis,
+    };
+  };
+
+  // 旁路观察：任何工具的后台结果登记 + job_output 输出解析进度。
   ctx.on('tools/execute', async (exec, next) => {
-    const isBackgroundPwsh =
-      exec.name === 'pwsh' &&
-      exec.arguments !== null && typeof exec.arguments === 'object' &&
-      exec.arguments.run_in_background === true;
+    if (jobs === undefined) return next();
     const isJobOutput = exec.name === 'job_output' &&
       exec.arguments !== null && typeof exec.arguments === 'object' &&
       typeof exec.arguments.job_id === 'string';
-    if (jobs === undefined) return next();
-    if (isBackgroundPwsh) {
-      const callId = exec.callId;
-      const command = typeof exec.arguments.command === 'string' ? exec.arguments.command : '';
-      byCall.set(callId, { command, startedAt: Date.now(), status: 'starting', jobId: null });
-      try {
-        const result = await next();
-        if (!result.isError && result.value !== null && typeof result.value === 'object' &&
-            result.value.kind === 'background' && typeof result.value.jobId === 'string') {
-          const jobId = result.value.jobId;
-          const rec = byCall.get(callId);
-          if (rec !== undefined) { rec.jobId = jobId; rec.status = 'tracking'; }
-          byJob.set(jobId, { agent: exec.agent, callId, command, last: null, progress: null, learned: false });
-          snapshotOf(jobId);
-        } else {
-          const rec = byCall.get(callId);
-          if (rec !== undefined) rec.status = 'untrackable';
-        }
-        return result;
-      } catch (err) {
-        const rec = byCall.get(callId);
-        if (rec !== undefined) rec.status = 'failed';
-        throw err;
-      }
-    }
     if (isJobOutput) {
       const jobId = exec.arguments.job_id;
       const entry = byJob.get(jobId);
@@ -241,7 +233,29 @@ export function apply(ctx) {
         throw err;
       }
     }
-    return next();
+    // 通用登记：任何工具返回 background jobId 即跟踪（pwsh/bash/subagent/…）。
+    try {
+      const result = await next();
+      if (!result.isError && result.value !== null && typeof result.value === 'object' &&
+          result.value.kind === 'background' && typeof result.value.jobId === 'string') {
+        const jobId = result.value.jobId;
+        if (!byJob.has(jobId)) {
+          byJob.set(jobId, {
+            jobId,
+            agent: exec.agent,
+            callId: exec.callId,
+            command: labelOf(exec),
+            last: null,
+            progress: null,
+            learned: false,
+          });
+          snapshotOf(jobId);
+        }
+      }
+      return result;
+    } catch (err) {
+      throw err;
+    }
   });
 
   if (jobs !== undefined) {
@@ -250,6 +264,7 @@ export function apply(ctx) {
     }), 'pwsh-progress: jobs observer');
   }
 
+  /** POST /state {jobId} → 单个任务状态 + 进度 + ETA。 */
   ctx.effect(() => ctx.webServer.register({
     path: '/api/dsh-pwsh-progress/state',
     async handler(req, res) {
@@ -278,27 +293,37 @@ export function apply(ctx) {
         writeJson(res, 200, { unknown: true });
         return;
       }
-      const entry = byJob.get(jobId);
-      const now = Date.now();
-      const eta = computeEta(entry, now);
-      const pct = entry !== undefined ? pctOf(entry.progress) : null;
-      writeJson(res, 200, {
-        jobId,
-        status: snap.status,
-        detail: snap.detail,
-        startedAt: snap.startedAt,
-        finishedAt: snap.finishedAt,
-        command: entry !== undefined ? entry.command : null,
-        elapsedMs: snap.finishedAt !== null ? snap.finishedAt - snap.startedAt
-          : (snap.startedAt !== null ? now - snap.startedAt : null),
-        progressPct: pct,
-        progressLabel: entry !== undefined ? progressLabel(entry.progress) : null,
-        etaMs: eta.etaMs,
-        etaBasis: eta.basis,
-      });
+      writeJson(res, 200, stateOf(byJob.get(jobId), Date.now()));
     },
   }), 'pwsh-progress: state route');
 
+  /** POST /list {} → 全部已登记任务（活跃优先）。 */
+  ctx.effect(() => ctx.webServer.register({
+    path: '/api/dsh-pwsh-progress/list',
+    async handler(req, res) {
+      if (!isLoopbackRequest(req)) {
+        writeJson(res, 403, { error: 'forbidden' });
+        return;
+      }
+      if (req.method !== 'POST') {
+        writeJson(res, 405, { error: `method not allowed: ${req.method}` });
+        return;
+      }
+      const now = Date.now();
+      const out = [];
+      for (const [jobId, entry] of byJob) {
+        entry.jobId = jobId;
+        snapshotOf(jobId);
+        const s = stateOf(entry, now);
+        if (s !== null) out.push(s);
+      }
+      const rank = (status) => status === 'running' ? 0 : status === 'stopping' ? 1 : 2;
+      out.sort((a, b) => rank(a.status) - rank(b.status) || (b.startedAt || 0) - (a.startedAt || 0));
+      writeJson(res, 200, { jobs: out });
+    },
+  }), 'pwsh-progress: list route');
+
+  /** POST /kill {jobId} → 请求停止。 */
   ctx.effect(() => ctx.webServer.register({
     path: '/api/dsh-pwsh-progress/kill',
     async handler(req, res) {
