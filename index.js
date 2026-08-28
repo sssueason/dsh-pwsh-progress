@@ -11,7 +11,7 @@
 export const name = 'pwsh-progress';
 
 /** 服务依赖：Web 路由表 + 系统提示公告。jobs 经 ctx.get 按需读取。 */
-export const inject = ['webServer', 'systemPrompt'];
+export const inject = ['systemPrompt'];
 
 /** 公告小节顺序（工具引导带内）。 */
 const SECTION_ORDER = 215;
@@ -289,7 +289,8 @@ export function apply(ctx) {
   }
 
   /** POST /state {jobId} → 单个任务状态 + 进度 + ETA。 */
-  ctx.effect(() => ctx.webServer.register({
+  const registerRoutes = (webServer) => {
+    ctx.effect(() => webServer.register({
     path: '/api/dsh-pwsh-progress/state',
     async handler(req, res) {
       if (!isLoopbackRequest(req)) {
@@ -322,7 +323,7 @@ export function apply(ctx) {
   }), 'pwsh-progress: state route');
 
   /** POST /list {} → 全部已登记任务（活跃优先）。 */
-  ctx.effect(() => ctx.webServer.register({
+  ctx.effect(() => webServer.register({
     path: '/api/dsh-pwsh-progress/list',
     async handler(req, res) {
       if (!isLoopbackRequest(req)) {
@@ -348,7 +349,7 @@ export function apply(ctx) {
   }), 'pwsh-progress: list route');
 
   /** POST /kill {jobId} → 请求停止。 */
-  ctx.effect(() => ctx.webServer.register({
+  ctx.effect(() => webServer.register({
     path: '/api/dsh-pwsh-progress/kill',
     async handler(req, res) {
       if (!isLoopbackRequest(req)) {
@@ -384,6 +385,24 @@ export function apply(ctx) {
       }
     },
   }), 'pwsh-progress: kill route');
+  };
+
+  // webServer 可选：无 webServer 的 profile（tui/CLI）不挂起，路由探测注册（最多 30s）
+  let ws = ctx.get('webServer')
+  if (ws !== undefined) {
+    registerRoutes(ws)
+  } else {
+    let tries = 0
+    const probe = ctx.setInterval(() => {
+      ws = ctx.get('webServer')
+      if (ws !== undefined) {
+        registerRoutes(ws)
+        probe()
+      } else if (++tries >= 15) {
+        probe()
+      }
+    }, 2000)
+  }
 
   ctx.systemPrompt.section({
     name: 'tool:pwsh-progress',

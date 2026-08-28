@@ -19,7 +19,14 @@
     }
   },
   "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
     "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true,
+      "description": "浏览器 client 由平台 seed 提供（react 在浏览器 loader seed 表）；npm peer 仅为开发期类型提示，安装时无需解析"
+    }
   },
   "scripts": {
     "test": "node --test test/smoke.test.mjs"
