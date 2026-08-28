@@ -10,8 +10,8 @@
 /** 稳定 cordis 插件名。 */
 export const name = 'pwsh-progress';
 
-/** 服务依赖：Web 路由表 + 系统提示公告。jobs 经 ctx.get 按需读取。 */
-export const inject = ['systemPrompt'];
+/** 服务依赖：Web 路由表 + 系统提示公告 + timer（ctx.setInterval 探测）。jobs 经 ctx.get 按需读取。 */
+export const inject = ['systemPrompt', 'timer'];
 
 /** 公告小节顺序（工具引导带内）。 */
 const SECTION_ORDER = 215;
