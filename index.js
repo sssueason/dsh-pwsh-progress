@@ -5,6 +5,16 @@
  * 用非消费式 jobs.get 跟踪状态（绝不调用 jobs.read，模型 job_output 不受影响）；
  * 从模型 job_output 已读输出解析 N/M、NN% 进度并估算 ETA（历史均值兜底）。
  * 路由（仅回环 + 同源）：POST /api/dsh-pwsh-progress/{state,list,kill}
+ *
+ * 与内核 jobs 服务的契约（2026-09-26 对齐，见 test/host.test.mjs 的回归）：
+ *   · `jobs.get(id, caller)` / `jobs.kill(id, caller, reason)` 的 `caller` 是 **SessionId 字符串**
+ *     （`exec.agent?.id`），不是 Agent 对象 —— 传错就会被归属栅栏判成别人的任务；
+ *   · 任务事件走 **`jobs.events.subscribe(filter, listener)`**（`{}` = 全部所有者）；
+ *     老内核的 `jobs.onJobsChanged` 作为兜底保留；
+ *   · 投影里的 `progress` 是内核新增的一等进度行（生产者 `updateProgress` 发布），可当标签兜底。
+ *
+ * ★ 注册顺序契约：**可见面（路由 / 系统提示）先注册，可选观察者最后注册**，且观察者失败要降级不抛 ——
+ *   否则一次 API 漂移就会让整个插件在 UI 上静默消失（2026-09-26 真实事故）。
  */
 
 /** 稳定 cordis 插件名。 */
@@ -145,13 +155,19 @@ export function apply(ctx) {
     const entry = byJob.get(jobId);
     if (entry === undefined) return null;
     try {
-      const snap = jobs.get(jobId, entry.agent);
+      /* 2026-09-26 修：caller 必须是 **SessionId 字符串**。内核 `jobs.get(id, caller)` 用它做归属栅栏
+         （dsh-jobs-local 的 assertAccess：`job.owner.id !== caller` ⇒ 抛 "belongs to another session"），
+         旧代码传的是 Agent 对象 ⇒ 每个有主任务都被判成"别人的任务"，卡片只能显示 gone。 */
+      const snap = jobs.get(jobId, entry.agentId);
       entry.last = {
         status: snap.status,
         detail: typeof snap.detail === 'string' ? snap.detail : null,
         startedAt: typeof snap.startedAt === 'number' ? snap.startedAt : null,
         finishedAt: typeof snap.finishedAt === 'number' ? snap.finishedAt : null,
         label: snap.label,
+        /* 内核新增的一等进度行（生产者经 handle.updateProgress 发布；pwsh 工具不发布，workflow/subagent 会）。
+           取不到就保持 null，仍走"解析 job_output 输出"的老路。 */
+        progress: typeof snap.progress === 'string' ? snap.progress : null,
       };
       // 仅 completed 记历史
       if (snap.status === 'completed' && entry.learned !== true &&
@@ -215,7 +231,8 @@ export function apply(ctx) {
       elapsedMs: snap.finishedAt !== null ? snap.finishedAt - snap.startedAt
         : (snap.startedAt !== null ? now - snap.startedAt : null),
       progressPct: pct,
-      progressLabel: progressLabel(entry.progress),
+      /* 输出里解析不到百分比时，退到内核给的生产者进度行（纯文本，前端显示不确定进度条 + 这行字）。 */
+      progressLabel: progressLabel(entry.progress) ?? (snap.progress !== null && snap.progress !== undefined ? snap.progress : null),
       etaMs: eta.etaMs,
       etaBasis: eta.basis,
     };
@@ -263,7 +280,8 @@ export function apply(ctx) {
         if (!byJob.has(jobId)) {
           byJob.set(jobId, {
             jobId,
-            agent: exec.agent,
+            /* 归属栅栏用的 **SessionId 字符串**（不是 Agent 对象）——见 snapshotOf 里的注释。 */
+            agentId: exec.agent?.id,
             callId: exec.callId,
             command: labelOf(exec),
             last: null,
@@ -282,11 +300,21 @@ export function apply(ctx) {
     }
   });
 
-  if (jobs !== undefined) {
-    ctx.effect(() => jobs.onJobsChanged(() => {
-      for (const jobId of byJob.keys()) snapshotOf(jobId);
-    }), 'pwsh-progress: jobs observer');
-  }
+  /* 任务事件：内核 2026-09 起把 `jobs.onJobsChanged` 换成了事件流 `jobs.events.subscribe(filter, listener)`
+     （@deepseek-ai/dsh-jobs：filter 可为 {} / {owner} / {owners:'scope'}；事件类型
+     registered / progress / stopping / settled / removed / output）。两条都试，向后兼容。
+     ★ 这里只定义、**不注册** —— 观察者属可选能力，它失败绝不能连坐路由与系统提示（调用点在文件末尾）。 */
+  const observeJobs = () => {
+    if (jobs === undefined) return;
+    const refresh = () => { for (const jobId of byJob.keys()) snapshotOf(jobId); };
+    if (jobs.events !== undefined && typeof jobs.events.subscribe === 'function') {
+      ctx.effect(() => jobs.events.subscribe({}, refresh), 'pwsh-progress: jobs observer (events.subscribe)');
+      return;
+    }
+    if (typeof jobs.onJobsChanged === 'function') {
+      ctx.effect(() => jobs.onJobsChanged(refresh), 'pwsh-progress: jobs observer (onJobsChanged)');
+    }
+  };
 
   /** POST /state {jobId} → 单个任务状态 + 进度 + ETA。 */
   const registerRoutes = (webServer) => {
@@ -378,7 +406,7 @@ export function apply(ctx) {
         return;
       }
       try {
-        const outcome = jobs.kill(jobId, entry.agent);
+        const outcome = jobs.kill(jobId, entry.agentId, 'stopped from progress card');
         writeJson(res, 200, { outcome });
       } catch (err) {
         writeJson(res, 200, { error: String(err && err.message ? err.message : err) });
@@ -409,6 +437,19 @@ export function apply(ctx) {
     order: SECTION_ORDER,
     text: PWSH_PROGRESS_GUIDANCE,
   });
+
+  /* ★ 顺序契约（2026-09-26 修 —— 这次事故的教训就写在这里）：**可见面先注册，可选观察者最后注册**。
+     原顺序是「观察者 → 路由 → 公告」，而观察者里那行 `jobs.onJobsChanged(...)` 在新内核上直接 TypeError
+     ⇒ apply() 中途抛出 ⇒ 路由与系统提示公告**一起没注册**：插件在 UI 上彻底消失，且一行日志都没有
+     （症状正是"进度条不见了"，却被误当成"pwsh 工具的问题"）。
+     现在观察者失败只降级成"少一次实时推送"，前端本来就有 0.7–1s 轮询，功能不受影响。 */
+  try {
+    observeJobs();
+  } catch (err) {
+    const msg = `pwsh-progress: jobs 观察者注册失败（进度卡片仍可用，前端仍按轮询刷新）：${String(err && err.message ? err.message : err)}`;
+    if (ctx.logger !== undefined && typeof ctx.logger.warn === 'function') ctx.logger.warn(msg);
+    else console.warn(msg);
+  }
 }
 
 // 测试出口：纯函数导出（对生产无副作用；模块无外部依赖，可直接 import）。
